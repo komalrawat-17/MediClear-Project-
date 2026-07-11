@@ -51,3 +51,22 @@ router.post("/login", async (req, res) => {
 });
 
 export default router;
+
+// GET /auth/me — checks a token and returns the logged-in user, if valid
+router.get("/me", async (req, res) => {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        return res.status(401).json({ error: "No token provided." });
+    }
+
+    const token = authHeader.split(" ")[1];
+
+    const { data, error } = await supabase.auth.getUser(token);
+
+    if (error || !data.user) {
+        return res.status(401).json({ error: "Invalid or expired session." });
+    }
+
+    res.status(200).json({ user: data.user });
+});
