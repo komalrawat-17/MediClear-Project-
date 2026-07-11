@@ -1,0 +1,24 @@
+{
+  "name": "mediclear-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "MediClear backend API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "multer": "^1.4.5-lts.1",
+    "pdf-parse": "^1.1.1",
+    "tesseract.js": "^5.1.0",
+    "openai": "^4.52.0",
+    "@supabase/supabase-js": "^2.43.0"
+  },
+  "allowScripts": {
+    "tesseract.js@5.1.1": true
+  }
+}
