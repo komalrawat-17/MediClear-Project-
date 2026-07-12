@@ -87,3 +87,50 @@ Rules:
 
   return parsed;
 }
+
+// STEP 3: DEEPER REASONING
+// Only runs on values Step 2 flagged as ambiguous. Cross-references how far
+// the value deviates from its reference range, and how clinically significant
+// that specific test type typically is, before finalizing a judgment.
+export async function deeperReasoning(ambiguousValue, originalValue) {
+  const prompt = `You are a senior medical reviewer doing a closer, second look
+at one specific lab test value that was flagged as borderline/ambiguous.
+
+Test details:
+- Test name: ${originalValue.test_name}
+- Value: ${originalValue.value}
+- Reference range: ${originalValue.reference_range}
+- Initial reasoning from first-pass review: ${ambiguousValue.reasoning}
+
+Do a deeper analysis considering:
+1. How far, proportionally, does this value deviate from the reference range edge?
+2. How clinically significant is this specific test type generally? (e.g. a
+   mildly elevated WBC count is often less urgent than a mildly abnormal
+   creatinine, since creatinine relates to kidney function)
+3. Based on both of these, what is the appropriate urgency level?
+
+Return ONLY a JSON object, no other text, in this exact format:
+{
+  "test_name": "...",
+  "deviation_analysis": "one sentence on how far/significant the deviation is",
+  "clinical_context": "one sentence on why this test type matters (or doesn't) at this level",
+  "final_status": "Normal" or "Monitor" or "Consult Doctor Soon"
+}`;
+
+  const response = await aiClient.chat.completions.create({
+    model: AI_MODEL,
+    messages: [{ role: "user", content: prompt }],
+  });
+
+  const raw = response.choices[0].message.content;
+  const cleaned = raw.replace(/```json|```/g, "").trim();
+
+  let parsed;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch (err) {
+    throw new Error("AI did not return valid JSON for the deeper reasoning step: " + raw);
+  }
+
+  return parsed;
+}
