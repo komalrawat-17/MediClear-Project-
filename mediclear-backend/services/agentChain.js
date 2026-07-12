@@ -1,5 +1,26 @@
 import { aiClient, AI_MODEL } from "../config/aiClient.js";
 
+// AI models sometimes wrap JSON in code fences, or leak internal reasoning
+// text before/after the actual JSON. This finds the JSON object or array
+// hiding in the response and parses just that part, ignoring the rest.
+function extractJSON(rawText) {
+  // Find the first { or [ and the last } or ] — the JSON is between them.
+  const firstBrace = rawText.search(/[[{]/);
+  const lastBrace = Math.max(rawText.lastIndexOf("}"), rawText.lastIndexOf("]"));
+
+  if (firstBrace === -1 || lastBrace === -1 || lastBrace < firstBrace) {
+    throw new Error("No JSON object or array found in AI response: " + rawText);
+  }
+
+  const jsonSlice = rawText.slice(firstBrace, lastBrace + 1);
+
+  try {
+    return JSON.parse(jsonSlice);
+  } catch (err) {
+    throw new Error("Could not parse extracted JSON: " + jsonSlice);
+  }
+}
+
 // STEP 1: EXTRACT
 // Reads raw report text and pulls out every test value as structured data.
 export async function extractTestValues(reportText) {
@@ -22,17 +43,8 @@ ${reportText}
     messages: [{ role: "user", content: prompt }],
   });
 
-  const raw = response.choices[0].message.content;
-  const cleaned = raw.replace(/```json|```/g, "").trim();
-
-  let parsed;
-  try {
-    parsed = JSON.parse(cleaned);
-  } catch (err) {
-    throw new Error("AI did not return valid JSON for the extract step: " + raw);
-  }
-
-  return parsed;
+ const raw = response.choices[0].message.content;
+  return extractJSON(raw);
 }
 
 // STEP 2: SELF-ASSESSMENT
@@ -76,16 +88,7 @@ Rules:
   });
 
   const raw = response.choices[0].message.content;
-  const cleaned = raw.replace(/```json|```/g, "").trim();
-
-  let parsed;
-  try {
-    parsed = JSON.parse(cleaned);
-  } catch (err) {
-    throw new Error("AI did not return valid JSON for the self-assess step: " + raw);
-  }
-
-  return parsed;
+  return extractJSON(raw);
 }
 
 // STEP 3: DEEPER REASONING
@@ -123,14 +126,54 @@ Return ONLY a JSON object, no other text, in this exact format:
   });
 
   const raw = response.choices[0].message.content;
-  const cleaned = raw.replace(/```json|```/g, "").trim();
+  return extractJSON(raw);
+}
 
-  let parsed;
-  try {
-    parsed = JSON.parse(cleaned);
-  } catch (err) {
-    throw new Error("AI did not return valid JSON for the deeper reasoning step: " + raw);
-  }
+// STEP 4: FINALIZE
+// Combines everything from Steps 1-3 into the final, user-facing result for
+// one test value: a plain-language explanation, a final urgency status, and
+// whether a specialist referral is warranted.
+export async function finalizeValue(originalValue, assessedValue, deeperResult) {
+  const statusSource = deeperResult
+    ? deeperResult.final_status
+    : assessedValue.preliminary_status;
 
-  return parsed;
+  const contextForPrompt = deeperResult
+    ? `This value went through deeper review: ${deeperResult.deviation_analysis} ${deeperResult.clinical_context}`
+    : `Initial assessment: ${assessedValue.reasoning}`;
+
+  const prompt = `You are explaining a lab test result to a patient with no
+medical background, in warm, plain, everyday language. Do not use jargon.
+
+Test: ${originalValue.test_name}
+Value: ${originalValue.value}
+Reference range: ${originalValue.reference_range}
+Determined urgency status: ${statusSource}
+Reasoning so far: ${contextForPrompt}
+
+Write a short (1-3 sentence) plain-language explanation of what this result
+means for the person, matching the tone to the urgency level (calm and
+reassuring for Normal, informative but not alarming for Monitor, clear and
+direct for Consult Doctor Soon).
+
+Also decide: does this specific result warrant suggesting the person see a
+specialist (e.g. a cardiologist for cholesterol, a nephrologist for
+creatinine)? Only suggest one if the status is "Consult Doctor Soon" AND a
+specific specialist type is genuinely relevant — otherwise leave it empty.
+
+Return ONLY a JSON object, no other text, in this exact format:
+{
+  "test_name": "...",
+  "status": "Normal" or "Monitor" or "Consult Doctor Soon",
+  "explanation": "...",
+  "specialist_suggestion": "..." or ""
+}`;
+
+  const response = await aiClient.chat.completions.create({
+    model: AI_MODEL,
+    messages: [{ role: "user", content: prompt }],
+  });
+
+  const raw = response.choices[0].message.content;
+  return extractJSON(raw);
 }

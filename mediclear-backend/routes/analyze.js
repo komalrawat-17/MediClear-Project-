@@ -2,7 +2,7 @@
 import express from "express";
 import { requireAuth } from "../middleware/requireAuth.js";
 import { supabase } from "../config/supabaseClient.js";
-import { extractTestValues, selfAssessValues, deeperReasoning } from "../services/agentChain.js";
+import { extractTestValues, selfAssessValues, deeperReasoning, finalizeValue } from "../services/agentChain.js";
 
 const router = express.Router();
 
@@ -76,11 +76,50 @@ router.post("/", requireAuth, async (req, res) => {
       deeperResults.push(result);
     }
 
+    // STEP 4: Finalize — every value gets a final status + explanation
+    const finalResults = [];
+
+    for (const assessedValue of assessedValues) {
+      const originalValue = extractedValues.find(
+        (v) => v.test_name === assessedValue.test_name
+      );
+      const deeperResult = deeperResults.find(
+        (d) => d.test_name === assessedValue.test_name
+      );
+
+      const finalStart = Date.now();
+      const finalValue = await finalizeValue(originalValue, assessedValue, deeperResult);
+      const finalDuration = Date.now() - finalStart;
+
+      await supabase.from("agent_logs").insert({
+        report_id: report.id,
+        step_name: "finalize",
+        reasoning_output: finalValue,
+        duration_ms: finalDuration,
+      });
+
+      // Save the finalized result into test_values — this is what the
+      // Results screen will read from in Milestone 3.
+      await supabase.from("test_values").insert({
+        report_id: report.id,
+        test_name: finalValue.test_name,
+        value: originalValue.value,
+        reference_range: originalValue.reference_range,
+        status: finalValue.status,
+        explanation: finalValue.explanation,
+        specialist_suggestion: finalValue.specialist_suggestion || null,
+      });
+
+      finalResults.push(finalValue);
+    }
+
+    // Mark the report as complete now that all values have been processed
+    await supabase.from("reports").update({ status: "complete" }).eq("id", report.id);
+
     res.status(200).json({
-      message: "Steps 1-3 (extract, self-assess, deep reasoning) complete.",
+      message: "Full agent reasoning chain complete (extract → self-assess → deep reasoning → finalize).",
       reportId: report.id,
-      assessedValues,
-      deeperResults,
+      finalResults,
     });
   } catch (err) {
     console.error(err);
