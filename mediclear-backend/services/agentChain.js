@@ -4,7 +4,6 @@ import { aiClient, AI_MODEL } from "../config/aiClient.js";
 // text before/after the actual JSON. This finds the JSON object or array
 // hiding in the response and parses just that part, ignoring the rest.
 function extractJSON(rawText) {
-  // Find the first { or [ and the last } or ] — the JSON is between them.
   const firstBrace = rawText.search(/[[{]/);
   const lastBrace = Math.max(rawText.lastIndexOf("}"), rawText.lastIndexOf("]"));
 
@@ -12,13 +11,35 @@ function extractJSON(rawText) {
     throw new Error("No JSON object or array found in AI response: " + rawText);
   }
 
-  const jsonSlice = rawText.slice(firstBrace, lastBrace + 1);
+  // Strip stray non-breaking spaces and other invisible characters that
+  // free-tier models occasionally inject, which break JSON parsing.
+  const jsonSlice = rawText
+    .slice(firstBrace, lastBrace + 1)
+    .replace(/\u00a0/g, " ");
 
   try {
     return JSON.parse(jsonSlice);
   } catch (err) {
     throw new Error("Could not parse extracted JSON: " + jsonSlice);
   }
+}
+
+// Wraps an AI call with automatic retry — free-tier models occasionally
+// return malformed JSON; retrying once or twice usually succeeds since
+// each call is a fresh, independent attempt.
+async function callAIWithRetry(callFn, maxRetries = 2) {
+  let lastError;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await callFn();
+    } catch (err) {
+      lastError = err;
+      console.log(`AI call failed (attempt ${attempt + 1}/${maxRetries + 1}): ${err.message}`);
+    }
+  }
+
+  throw lastError;
 }
 
 // STEP 1: EXTRACT
@@ -38,13 +59,14 @@ Report text:
 ${reportText}
 """`;
 
-  const response = await aiClient.chat.completions.create({
-    model: AI_MODEL,
-    messages: [{ role: "user", content: prompt }],
+  return callAIWithRetry(async () => {
+    const response = await aiClient.chat.completions.create({
+      model: AI_MODEL,
+      messages: [{ role: "user", content: prompt }],
+    });
+    const raw = response.choices[0].message.content;
+    return extractJSON(raw);
   });
-
- const raw = response.choices[0].message.content;
-  return extractJSON(raw);
 }
 
 // STEP 2: SELF-ASSESSMENT
@@ -82,13 +104,14 @@ Rules:
 - If is_ambiguous is true, set preliminary_status to null.
 - If is_ambiguous is false, you must provide a confident preliminary_status.`;
 
-  const response = await aiClient.chat.completions.create({
-    model: AI_MODEL,
-    messages: [{ role: "user", content: prompt }],
+  return callAIWithRetry(async () => {
+    const response = await aiClient.chat.completions.create({
+      model: AI_MODEL,
+      messages: [{ role: "user", content: prompt }],
+    });
+    const raw = response.choices[0].message.content;
+    return extractJSON(raw);
   });
-
-  const raw = response.choices[0].message.content;
-  return extractJSON(raw);
 }
 
 // STEP 3: DEEPER REASONING
@@ -120,13 +143,14 @@ Return ONLY a JSON object, no other text, in this exact format:
   "final_status": "Normal" or "Monitor" or "Consult Doctor Soon"
 }`;
 
-  const response = await aiClient.chat.completions.create({
-    model: AI_MODEL,
-    messages: [{ role: "user", content: prompt }],
+  return callAIWithRetry(async () => {
+    const response = await aiClient.chat.completions.create({
+      model: AI_MODEL,
+      messages: [{ role: "user", content: prompt }],
+    });
+    const raw = response.choices[0].message.content;
+    return extractJSON(raw);
   });
-
-  const raw = response.choices[0].message.content;
-  return extractJSON(raw);
 }
 
 // STEP 4: FINALIZE
@@ -169,11 +193,114 @@ Return ONLY a JSON object, no other text, in this exact format:
   "specialist_suggestion": "..." or ""
 }`;
 
-  const response = await aiClient.chat.completions.create({
-    model: AI_MODEL,
-    messages: [{ role: "user", content: prompt }],
+  return callAIWithRetry(async () => {
+    const response = await aiClient.chat.completions.create({
+      model: AI_MODEL,
+      messages: [{ role: "user", content: prompt }],
+    });
+    const raw = response.choices[0].message.content;
+    return extractJSON(raw);
+  });
+}
+
+// ... [Keep your existing code above exactly as it is] ...
+
+/**
+ * Main Agentic Orchestrator
+ * Runs the full 4-step reasoning chain and logs every intermediate decision.
+ */
+export async function runAgenticChain(reportText) {
+  const executionLogs = [];
+  const finalizedExtractedValues = [];
+
+  // --- STEP 1: EXTRACT ---
+  console.log("Agent Chain: Running Step 1 (Extraction)...");
+  const extractedItems = await extractTestValues(reportText);
+  
+  executionLogs.push({
+    step_name: "Step 1: Raw Text Extraction",
+    reasoning_output: JSON.stringify(extractedItems, null, 2)
   });
 
-  const raw = response.choices[0].message.content;
-  return extractJSON(raw);
+  if (!extractedItems || extractedItems.length === 0) {
+    return { extractedValues: [], logs: executionLogs };
+  }
+
+  // --- STEP 2: SELF-ASSESSMENT ---
+  console.log("Agent Chain: Running Step 2 (Self-Assessment)...");
+  const assessments = await selfAssessValues(extractedItems);
+  
+  executionLogs.push({
+    step_name: "Step 2: Ambiguity Self-Assessment",
+    reasoning_output: JSON.stringify(assessments, null, 2)
+  });
+
+  // --- PROCESS EACH TEST INDIVIDUALLY THROUGH STEPS 3 & 4 ---
+  for (let i = 0; i < extractedItems.length; i++) {
+    const original = extractedItems[i];
+    
+    // Find matching assessment by test name
+    const assessed = assessments.find(a => a.test_name.toLowerCase() === original.test_name.toLowerCase()) || {
+      test_name: original.test_name,
+      is_ambiguous: false,
+      preliminary_status: "Monitor",
+      reasoning: "Fallback assessment applied due to mismatched tracking name."
+    };
+
+    let deeperResult = null;
+
+    // --- STEP 3: DEEPER REASONING (Only runs if Step 2 flags it as ambiguous!) ---
+    if (assessed.is_ambiguous) {
+      console.log(`Agent Chain: Running Step 3 (Deeper Review) for ambiguous test: ${original.test_name}`);
+      try {
+        deeperResult = await deeperReasoning(assessed, original);
+        
+        executionLogs.push({
+          step_name: `Step 3: Deeper Reasoning (${original.test_name})`,
+          reasoning_output: JSON.stringify(deeperResult, null, 2)
+        });
+      } catch (error) {
+        console.error(`Failed Step 3 deep review for ${original.test_name}:`, error.message);
+        deeperResult = {
+          test_name: original.test_name,
+          deviation_analysis: "System failed to assess borderline discrepancy automatically.",
+          clinical_context: "General safety margin monitoring required.",
+          final_status: "Monitor"
+        };
+      }
+    }
+
+    // --- STEP 4: FINALIZE USER-FACING EXPLANATION ---
+    console.log(`Agent Chain: Running Step 4 (Finalize Translation) for test: ${original.test_name}`);
+    try {
+      const finalExplanation = await finalizeValue(original, assessed, deeperResult);
+      
+      let patientExplanation = finalExplanation.explanation;
+      if (finalExplanation.specialist_suggestion) {
+        patientExplanation += ` Suggested action: ${finalExplanation.specialist_suggestion}`;
+      }
+
+      finalizedExtractedValues.push({
+        test_name: finalExplanation.test_name,
+        value: original.value,
+        reference_range: original.reference_range,
+        status: finalExplanation.status,
+        explanation: patientExplanation
+      });
+    } catch (error) {
+      console.error(`Failed Step 4 text translation for ${original.test_name}:`, error.message);
+      finalizedExtractedValues.push({
+        test_name: original.test_name,
+        value: original.value,
+        reference_range: original.reference_range,
+        status: deeperResult ? deeperResult.final_status : (assessed.preliminary_status || "Monitor"),
+        explanation: `Your raw result is ${original.value}. Please reference standard practitioner guidelines.`
+      });
+    }
+  }
+
+  return {
+    extractedValues: finalizedExtractedValues,
+    logs: executionLogs
+  };
 }

@@ -1,129 +1,79 @@
-
-import express from "express";
-import { requireAuth } from "../middleware/requireAuth.js";
-import { supabase } from "../config/supabaseClient.js";
-import { extractTestValues, selfAssessValues, deeperReasoning, finalizeValue } from "../services/agentChain.js";
+import express from 'express';
+import multer from 'multer';
+import { extractTextFromFile } from '../services/extractText.js';
+import { runAgenticChain } from '../services/agentChain.js';
+import { supabase } from '../config/supabaseClient.js'; 
+import { requireAuth } from '../middleware/requireAuth.js'; 
 
 const router = express.Router();
+const upload = multer({ storage: multer.memoryStorage() });
 
-router.post("/", requireAuth, async (req, res) => {
-  const { reportText } = req.body;
-
-  if (!reportText || reportText.trim().length === 0) {
-    return res.status(400).json({ error: "reportText is required." });
-  }
-
+// Protect the route with requireAuth so req.user.id is fully populated from the JWT token
+router.post('/', requireAuth, upload.single('report'), async (req, res) => {
   try {
-    // Every agent_logs row needs a report_id to point to, so we create
-    // the report record first, before running any AI steps.
-    const { data: report, error: reportError } = await supabase
-      .from("reports")
-      .insert({
-        user_id: req.user.id,
-        file_type: "text",
-        raw_text: reportText,
-        status: "processing",
-      })
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded.' });
+    }
+
+    const userId = req.user?.id; 
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized. Please sign in again.' });
+    }
+
+    // 1. Live Text Extraction Step (PDF or OCR)
+    const { text, fileType } = await extractTextFromFile(req.file);
+
+    // 2. Save report details to Supabase database
+    const { data: reportData, error: reportError } = await supabase
+      .from('reports')
+      .insert([{ user_id: userId, file_type: fileType, raw_text: text }])
       .select()
       .single();
 
     if (reportError) throw reportError;
+    const reportId = reportData.id;
 
-    // STEP 1: Extract
-    const extractStart = Date.now();
-    const extractedValues = await extractTestValues(reportText);
-    const extractDuration = Date.now() - extractStart;
-
-    await supabase.from("agent_logs").insert({
-      report_id: report.id,
-      step_name: "extract",
-      reasoning_output: extractedValues,
-      duration_ms: extractDuration,
-    });
-
-    // STEP 2: Self-assessment
-    const assessStart = Date.now();
-    const assessedValues = await selfAssessValues(extractedValues);
-    const assessDuration = Date.now() - assessStart;
-
-    await supabase.from("agent_logs").insert({
-      report_id: report.id,
-      step_name: "self_assess",
-      reasoning_output: assessedValues,
-      duration_ms: assessDuration,
-    });
-
-    // STEP 3: Deeper reasoning — only for values flagged ambiguous in Step 2
-    const ambiguousValues = assessedValues.filter((v) => v.is_ambiguous);
-
-    const deeperResults = [];
-    for (const ambiguousValue of ambiguousValues) {
-      const originalValue = extractedValues.find(
-        (v) => v.test_name === ambiguousValue.test_name
-      );
-
-      const deepStart = Date.now();
-      const result = await deeperReasoning(ambiguousValue, originalValue);
-      const deepDuration = Date.now() - deepStart;
-
-      await supabase.from("agent_logs").insert({
-        report_id: report.id,
-        step_name: "deep_reasoning",
-        reasoning_output: result,
-        duration_ms: deepDuration,
-      });
-
-      deeperResults.push(result);
+    // 3. Run the live multi-step AI reasoning workflow
+    const agentResult = await runAgenticChain(text);
+    
+    // 4. Record intermediate execution agent steps to logs
+    if (agentResult.logs && agentResult.logs.length > 0) {
+      const formattedLogs = agentResult.logs.map(log => ({
+        report_id: reportId,
+        step_name: log.step_name,
+        reasoning_output: log.reasoning_output
+      }));
+      
+      await supabase.from('agent_logs').insert(formattedLogs);
     }
 
-    // STEP 4: Finalize — every value gets a final status + explanation
-    const finalResults = [];
+    // 5. Store final verified patient test values
+    let finalResults = agentResult?.extractedValues || [];
 
-    for (const assessedValue of assessedValues) {
-      const originalValue = extractedValues.find(
-        (v) => v.test_name === assessedValue.test_name
-      );
-      const deeperResult = deeperResults.find(
-        (d) => d.test_name === assessedValue.test_name
-      );
+    if (finalResults.length > 0) {
+      const formattedValues = finalResults.map(val => ({
+        report_id: reportId,
+        test_name: val.test_name,
+        value: val.value,
+        reference_range: val.reference_range,
+        status: val.status, 
+        explanation: val.explanation
+      }));
 
-      const finalStart = Date.now();
-      const finalValue = await finalizeValue(originalValue, assessedValue, deeperResult);
-      const finalDuration = Date.now() - finalStart;
-
-      await supabase.from("agent_logs").insert({
-        report_id: report.id,
-        step_name: "finalize",
-        reasoning_output: finalValue,
-        duration_ms: finalDuration,
-      });
-
-      // Save the finalized result into test_values — this is what the
-      // Results screen will read from in Milestone 3.
-      await supabase.from("test_values").insert({
-        report_id: report.id,
-        test_name: finalValue.test_name,
-        value: originalValue.value,
-        reference_range: originalValue.reference_range,
-        status: finalValue.status,
-        explanation: finalValue.explanation,
-        specialist_suggestion: finalValue.specialist_suggestion || null,
-      });
-
-      finalResults.push(finalValue);
+      const { error: valuesError } = await supabase.from('test_values').insert(formattedValues);
+      if (valuesError) throw valuesError;
     }
 
-    // Mark the report as complete now that all values have been processed
-    await supabase.from("reports").update({ status: "complete" }).eq("id", report.id);
-
-    res.status(200).json({
-      message: "Full agent reasoning chain complete (extract → self-assess → deep reasoning → finalize).",
-      reportId: report.id,
-      finalResults,
+    // 6. Return seamless live response payload to frontend
+    return res.status(200).json({
+      success: true,
+      reportId: reportId,
+      results: finalResults
     });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Analysis failed: " + err.message });
+
+  } catch (error) {
+    console.error('Pipeline Processing Error:', error);
+    return res.status(500).json({ error: 'Failed to process lab report securely.' });
   }
 });
 
